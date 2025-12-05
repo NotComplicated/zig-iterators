@@ -1,29 +1,29 @@
 const std = @import("std");
 
 pub fn from_fn(fun: anytype) Iter(FromFn(@TypeOf(fun))) {
-    return .{ .impl = .{ .fun = .{ .inner = fun } } };
+    return .{ ._impl = .{ .fun = .init(fun) } };
 }
 
 pub fn from_slice(T: type, slice: []const T) Iter(Slice(T)) {
-    return .{ .impl = .{ .slice = slice } };
+    return .{ ._impl = .{ .slice = slice } };
 }
 
 fn Iter(Impl: type) type {
     return struct {
-        impl: Impl,
+        _impl: Impl,
 
         fn map(self: @This(), fun: anytype) Iter(Map(Impl, @TypeOf(fun))) {
             return .{
-                .impl = .{
-                    .inner = self.impl,
-                    .fun = .{ .inner = fun },
+                ._impl = .{
+                    .inner = self._impl,
+                    .fun = .init(fun),
                 },
             };
         }
 
         fn for_each(self: @This(), fun: anytype) void {
-            var impl = self.impl;
-            var fun_: Fn(@TypeOf(fun)) = .{ .inner = fun };
+            var impl = self._impl;
+            var fun_: Fn(@TypeOf(fun)) = .init(fun);
             while (impl.next()) |item| {
                 _ = fun_.call(.{item});
             }
@@ -33,8 +33,10 @@ fn Iter(Impl: type) type {
 }
 
 fn Fn(Inner: type) type {
+    const is_comptime_fn = @typeInfo(Inner) == .@"fn";
+    const TrueInner = if (is_comptime_fn) *const Inner else Inner;
     comptime var Deref = Inner;
-    comptime var is_ptr = false;
+    comptime var is_ptr = is_comptime_fn;
     const inner_fn = inner_fn: switch (@typeInfo(Deref)) {
         .pointer => |ptr| {
             Deref = ptr.child;
@@ -42,24 +44,24 @@ fn Fn(Inner: type) type {
             continue :inner_fn @typeInfo(Deref);
         },
         .@"fn" => |fn_| fn_,
-        inline else => |other| {
-            for (other.decls) |decl| {
-                if (std.mem.eql(u8, decl.name, "call"))
-                    break :inner_fn @typeInfo(@TypeOf(@field(Deref, "call"))).@"fn";
-            }
-            @compileError("Must be a function or have a `pub fn call(...)` method");
-        },
+        else => if (std.meta.hasFn(Deref, "call"))
+            @typeInfo(@TypeOf(@field(Deref, "call"))).@"fn"
+        else
+            @compileError("Must be a function or have a `pub fn call(...)` method"),
     };
 
     return struct {
-        inner: Inner,
+        inner: TrueInner,
 
         pub const Return = inner_fn.return_type.?;
 
-        fn call(self: *@This(), args: anytype) Return {
-            const deref: Deref = if (is_ptr) self.inner.* else self.inner;
+        pub fn init(inner: Inner) @This() {
+            return .{ .inner = if (is_comptime_fn) &inner else inner };
+        }
+
+        pub fn call(self: *@This(), args: anytype) Return {
             return switch (@typeInfo(Deref)) {
-                .@"fn" => @call(.auto, deref, args),
+                .@"fn" => @call(.auto, self.inner, args),
                 else => call: {
                     const self_param_is_ptr = @typeInfo(inner_fn.params[0].type.?) == .pointer;
                     const qualified = if (self_param_is_ptr and !is_ptr) &self.inner else self.inner;
@@ -68,8 +70,8 @@ fn Fn(Inner: type) type {
             };
         }
 
-        fn deinit(self: *@This()) void {
-            if (@hasDecl(Deref, "deinit")) self.inner.deinit();
+        pub fn deinit(self: *@This()) void {
+            if (std.meta.hasMethod(TrueInner, "deinit")) self.inner.deinit();
         }
     };
 }
@@ -126,14 +128,14 @@ fn Slice(T: type) type {
 }
 
 test "from_fn" {
-    var collector = struct {
+    var collect = struct {
         nums: std.ArrayList(u32) = .empty,
         alloc: std.mem.Allocator = std.testing.allocator,
         pub fn call(self: *@This(), item: u32) void {
             self.nums.append(self.alloc, item) catch {};
         }
     }{};
-    defer collector.nums.deinit(std.testing.allocator);
+    defer collect.nums.deinit(std.testing.allocator);
 
     from_fn(
         struct {
@@ -145,9 +147,9 @@ test "from_fn" {
             }
         }{},
     )
-        .for_each(&collector);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, collector.nums.items);
-    collector.nums.clearAndFree(std.testing.allocator);
+        .for_each(&collect);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, collect.nums.items);
+    collect.nums.clearAndFree(std.testing.allocator);
 
     const fibs = struct {
         nums: std.ArrayList(u32) = .empty,
@@ -164,6 +166,22 @@ test "from_fn" {
         }
     }{};
 
-    from_fn(fibs).for_each(&collector);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 8, 13, 21, 34 }, collector.nums.items);
+    from_fn(fibs).for_each(&collect);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 8, 13, 21, 34 }, collect.nums.items);
+}
+
+test "slice" {
+    var collect: struct {
+        chars: std.ArrayList(u8) = .empty,
+        pub fn call(self: *@This(), c: u8) void {
+            self.chars.append(std.testing.allocator, c) catch {};
+        }
+    } = .{};
+    defer collect.chars.deinit(std.testing.allocator);
+
+    from_slice(u8, "foobar")
+        .map(std.ascii.toUpper)
+        .for_each(&collect);
+
+    try std.testing.expectEqualSlices(u8, "FOOBAR", collect.chars.items);
 }
