@@ -1,10 +1,10 @@
 const std = @import("std");
 
-pub fn from_fn(fun: anytype) Iter(FromFn(@TypeOf(fun))) {
+pub fn fromFn(fun: anytype) Iter(FromFn(@TypeOf(fun))) {
     return .{ ._impl = .{ .fun = .init(fun) } };
 }
 
-pub fn from_slice(T: type, slice: []const T) Iter(Slice(T)) {
+pub fn fromSlice(T: type, slice: []const T) Iter(Slice(T)) {
     return .{ ._impl = .{ .slice = slice } };
 }
 
@@ -21,13 +21,28 @@ fn Iter(Impl: type) type {
             };
         }
 
-        fn for_each(self: @This(), fun: anytype) void {
+        fn forEach(self: @This(), fun: anytype) void {
             var impl = self._impl;
+            defer impl.deinit();
             var fun_: Fn(@TypeOf(fun)) = .init(fun);
-            while (impl.next()) |item| {
-                _ = fun_.call(.{item});
-            }
-            impl.deinit();
+            while (impl.next()) |item| _ = fun_.call(.{item});
+        }
+
+        fn intoList(self: @This(), alloc: std.mem.Allocator) !std.ArrayList(Impl.Item) {
+            var list: std.ArrayList(Impl.Item) = try .initCapacity(alloc, self._impl.sizeHint()[0]);
+            errdefer list.deinit(alloc);
+            var impl = self._impl;
+            defer impl.deinit();
+            while (impl.next()) |item| try list.append(alloc, item);
+            return list;
+        }
+
+        fn count(self: @This()) usize {
+            var impl = self._impl;
+            defer impl.deinit();
+            var total: usize = 0;
+            while (impl.next()) |_| total += 1;
+            return total;
         }
     };
 }
@@ -87,6 +102,10 @@ fn Map(Inner: type, FnInner: type) type {
             return self.fun.call(.{self.inner.next() orelse return null});
         }
 
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.inner.sizeHint();
+        }
+
         pub fn deinit(self: *@This()) void {
             self.inner.deinit();
             self.fun.deinit();
@@ -102,6 +121,10 @@ fn FromFn(FnInner: type) type {
 
         pub fn next(self: *@This()) ?Item {
             return self.fun.call(.{});
+        }
+
+        pub fn sizeHint(_: @This()) struct { usize, ?usize } {
+            return .{ 0, null };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -123,11 +146,15 @@ fn Slice(T: type) type {
             return item;
         }
 
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ self.slice.len, self.slice.len };
+        }
+
         pub fn deinit(_: *@This()) void {}
     };
 }
 
-test "from_fn" {
+test "fromFn" {
     var collect = struct {
         nums: std.ArrayList(u32) = .empty,
         alloc: std.mem.Allocator = std.testing.allocator,
@@ -137,7 +164,7 @@ test "from_fn" {
     }{};
     defer collect.nums.deinit(std.testing.allocator);
 
-    from_fn(
+    fromFn(
         struct {
             i: u32 = 0,
             pub fn call(self: *@This()) ?u32 {
@@ -147,7 +174,7 @@ test "from_fn" {
             }
         }{},
     )
-        .for_each(&collect);
+        .forEach(&collect);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, collect.nums.items);
     collect.nums.clearAndFree(std.testing.allocator);
 
@@ -166,7 +193,7 @@ test "from_fn" {
         }
     }{};
 
-    from_fn(fibs).for_each(&collect);
+    fromFn(fibs).forEach(&collect);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 8, 13, 21, 34 }, collect.nums.items);
 }
 
@@ -179,9 +206,27 @@ test "slice" {
     } = .{};
     defer collect.chars.deinit(std.testing.allocator);
 
-    from_slice(u8, "foobar")
+    fromSlice(u8, "foobar")
         .map(std.ascii.toUpper)
-        .for_each(&collect);
+        .forEach(&collect);
 
     try std.testing.expectEqualSlices(u8, "FOOBAR", collect.chars.items);
+}
+
+test "intoList" {
+    var list = try fromSlice(bool, &.{ true, false, false, true })
+        .map(
+            struct {
+                fn f(b: bool) bool {
+                    return !b;
+                }
+            }.f,
+        )
+        .intoList(std.testing.allocator);
+    defer list.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, false }, list.items);
+}
+
+test "count" {
+    try std.testing.expectEqual(9, fromSlice(u8, "foobarbaz").count());
 }
