@@ -8,6 +8,10 @@ pub fn fromSlice(T: type, slice: []const T) Iter(Slice(T)) {
     return .{ ._impl = .{ .slice = slice } };
 }
 
+pub fn fromSliceMut(T: type, slice: []T) Iter(SliceMut(T)) {
+    return .{ ._impl = .{ .slice = slice } };
+}
+
 pub fn range(Int: type, from: Int, to: ?Int) Iter(Range(Int)) {
     return .{ .n = from, .to = to };
 }
@@ -24,6 +28,11 @@ fn Iter(Impl: type) type {
             return self._impl.next();
         }
 
+        pub fn peek(self: *Self) ?Item {
+            if (!std.meta.hasMethod(Impl, "peek")) @compileError("Must call 'peekable' before peeking");
+            return self._impl.peek();
+        }
+
         pub fn advanceBy(self: *Self, n: usize) error{Exhausted}!void {
             for (0..n) |_| self._impl.next() orelse return error.Exhausted;
         }
@@ -32,6 +41,10 @@ fn Iter(Impl: type) type {
             var item = null;
             for (0..n) |_| item = self._impl.next() orelse return null;
             return item;
+        }
+
+        pub fn byRef(self: *Self) Iter(ByRef(Impl)) {
+            return .{ ._impl = .{ .inner = &self._impl } };
         }
 
         pub fn map(self: Self, fun: anytype) Iter(Map(Impl, @TypeOf(fun))) {
@@ -43,6 +56,24 @@ fn Iter(Impl: type) type {
         }
 
         pub fn filterMap(self: Self, fun: anytype) Iter(FilterMap(Impl, @TypeOf(fun))) {
+            return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
+        }
+
+        pub fn skip(self: Self, n: usize) Iter(Impl) {
+            var impl = self._impl;
+            for (0..n) |_| impl.next();
+            return .{ ._impl = impl };
+        }
+
+        pub fn take(self: Self, n: usize) Iter(Take(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl, .n = n } };
+        }
+
+        pub fn skipWhile(self: Self, fun: anytype) Iter(SkipWhile(Impl, @TypeOf(fun))) {
+            return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
+        }
+
+        pub fn takeWhile(self: Self, fun: anytype) Iter(TakeWhile(Impl, @TypeOf(fun))) {
             return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
         }
 
@@ -63,6 +94,22 @@ fn Iter(Impl: type) type {
             return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
         }
 
+        pub fn index(self: Self, i: usize) Iter(Index(Impl, i)) {
+            return .{ ._impl = .{ .inner = self._impl } };
+        }
+
+        pub fn dyn(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!Iter(Dyn(Item)) {
+            return .{ ._impl = try .init(self._impl, alloc) };
+        }
+
+        pub fn dynRef(self: Self) Iter(DynRef(Item)) {
+            return .{ ._impl = .init(Impl, self._impl) };
+        }
+
+        pub fn peekable(self: Self) Iter(Peek(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl } };
+        }
+
         pub fn consume(self: Self) void {
             var impl = self._impl;
             defer impl.deinit();
@@ -73,11 +120,12 @@ fn Iter(Impl: type) type {
             var impl = self._impl;
             defer impl.deinit();
             var fun_: Fn(@TypeOf(fun)) = .init(fun);
+            defer fun_.deinit();
             while (impl.next()) |item| _ = fun_.call(.{item});
         }
 
         pub fn intoList(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!std.ArrayList(Item) {
-            var list: std.ArrayList(Impl.Item) = try .initCapacity(alloc, self._impl.sizeHint()[0]);
+            var list: std.ArrayList(Item) = try .initCapacity(alloc, self._impl.sizeHint()[0]);
             errdefer list.deinit(alloc);
             var impl = self._impl;
             defer impl.deinit();
@@ -99,6 +147,66 @@ fn Iter(Impl: type) type {
             var last_item = null;
             while (impl.next()) |item| last_item = item;
             return last_item;
+        }
+
+        pub fn fold(self: Self, initial: anytype, fun: anytype) @TypeOf(initial) {
+            var impl = self._impl;
+            defer impl.deinit();
+            const FoldFn = Fn(@TypeOf(fun));
+            var fun_: FoldFn = .init(fun);
+            defer fun_.deinit();
+            if (FoldFn.Return != @TypeOf(initial)) @compileError("Fold function returns wrong type");
+            var folded = initial;
+            while (impl.next()) |item| {
+                folded = fun_.call(.{ folded, item });
+            }
+            return folded;
+        }
+
+        pub fn reduce(self: Self, fun: anytype) ?Item {
+            var self_ = self;
+            const initial = self_.next() orelse {
+                self_._impl.deinit();
+                return null;
+            };
+            return self_.fold(initial, fun);
+        }
+
+        pub fn all(self: Self, fun: anytype) bool {
+            var impl = self._impl;
+            defer impl.deinit();
+            var fun_: Fn(@TypeOf(fun)) = .init(fun);
+            defer fun_.deinit();
+            while (impl.next()) |item| if (!fun_.call(.{item})) return false;
+            return true;
+        }
+
+        pub fn any(self: Self, fun: anytype) bool {
+            var impl = self._impl;
+            defer impl.deinit();
+            var fun_: Fn(@TypeOf(fun)) = .init(fun);
+            defer fun_.deinit();
+            while (impl.next()) |item| if (fun_.call(.{item})) return true;
+            return false;
+        }
+
+        pub fn find(self: Self, fun: anytype) ?Item {
+            var impl = self._impl;
+            defer impl.deinit();
+            var fun_: Fn(@TypeOf(fun)) = .init(fun);
+            defer fun_.deinit();
+            while (impl.next()) |item| if (fun_.call(.{item})) return item;
+            return null;
+        }
+
+        pub fn position(self: Self, fun: anytype) ?usize {
+            var impl = self._impl;
+            defer impl.deinit();
+            var fun_: Fn(@TypeOf(fun)) = .init(fun);
+            defer fun_.deinit();
+            var pos = 0;
+            while (impl.next()) |item| : (pos += 1) if (fun_.call(.{item})) return pos;
+            return null;
         }
     };
 }
@@ -188,6 +296,27 @@ fn Slice(T: type) type {
     };
 }
 
+fn SliceMut(T: type) type {
+    return struct {
+        slice: []T,
+
+        pub const Item = *T;
+
+        pub fn next(self: *@This()) ?Item {
+            if (self.slice.len == 0) return null;
+            const item = &self.slice[0];
+            self.slice = self.slice[1..];
+            return item;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ self.slice.len, self.slice.len };
+        }
+
+        pub fn deinit(_: *@This()) void {}
+    };
+}
+
 fn Range(Int: type) type {
     return struct {
         n: Int,
@@ -215,6 +344,24 @@ fn Range(Int: type) type {
                 .lt => .{ @intCast(to - self.n), @intCast(to - self.n) },
                 .gt => .{ @intCast(self.n - to), @intCast(self.n - to) },
             } else .{ @intCast(std.math.maxInt(Int) - self.n), null };
+        }
+
+        pub fn deinit(_: *@This()) void {}
+    };
+}
+
+fn ByRef(Inner: type) type {
+    return struct {
+        inner: *Inner,
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            return self.inner.next();
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.inner.sizeHint();
         }
 
         pub fn deinit(_: *@This()) void {}
@@ -285,6 +432,88 @@ fn FilterMap(Inner: type, FnInner: type) type {
         pub fn deinit(self: *@This()) void {
             self.inner.deinit();
             self.fun.deinit();
+        }
+    };
+}
+
+fn Take(Inner: type) type {
+    return struct {
+        inner: Inner,
+        n: usize,
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            if (self.n == 0) return null;
+            self.n -= 1;
+            return self.inner.next();
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const lower, const upper = self.inner.sizeHint();
+            return .{ @min(self.n, lower), @min(self.n, upper) };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn SkipWhile(Inner: type, FnInner: type) type {
+    return struct {
+        inner: Inner,
+        fun: ?Fn(FnInner),
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            while (self.inner.next()) |item| {
+                if (self.fun) |fun| {
+                    if (!fun.call(.{item})) {
+                        self.fun.?.deinit();
+                        self.fun = null;
+                    }
+                } else return item;
+            }
+            return null;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ 0, self.inner.sizeHint()[1] };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            if (self.fun) |*fun| fun.deinit();
+        }
+    };
+}
+fn TakeWhile(Inner: type, FnInner: type) type {
+    return struct {
+        inner: Inner,
+        fun: ?Fn(FnInner),
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            const item = self.inner.next() orelse return null;
+            const fun = self.fun orelse return null;
+            if (!fun.call(.{item})) {
+                self.fun.?.deinit();
+                self.fun = null;
+                return null;
+            }
+            return item;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ 0, self.inner.sizeHint()[1] };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            if (self.fun) |*fun| fun.deinit();
         }
     };
 }
@@ -392,6 +621,169 @@ fn Zip(First: type, Second: type) type {
         }
     };
 }
+
+fn Index(Inner: type, i: usize) type {
+    return struct {
+        inner: Inner,
+
+        pub const Item = item: switch (@typeInfo(Inner.Item)) {
+            .pointer => |ptr| switch (ptr.size) {
+                .many, .slice => ptr.child,
+                else => continue :item ptr.child,
+            },
+            .array => |arr| if (arr.len > i) arr.child else @compileError("Index out of bounds"),
+            .@"struct" => |st| if (st.is_tuple)
+                if (st.fields.len > i) st.fields[i].type else @compileError("Index out of bounds")
+            else
+                @compileError("Item is not indexable"),
+            .vector => |v| if (v.len > i) v.child else @compileError("Index out of bounds"),
+            else => @compileError("Item is not indexable"),
+        };
+
+        pub fn next(self: *@This()) ?Item {
+            return (self.inner.next() orelse return null)[i];
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.inner.sizeHint();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn Dyn(Item_: type) type {
+    return struct {
+        data: *anyopaque,
+        vtable: *const VTable,
+
+        pub const Item = Item_;
+
+        const VTable = struct {
+            next: *const fn (self: *anyopaque) ?Item,
+            sizeHint: *const fn (self: *anyopaque) struct { usize, ?usize },
+            deinit: *const fn (self: *anyopaque) void,
+        };
+
+        pub fn init(inner: anytype, alloc: std.mem.Allocator) std.mem.Allocator.Error!Dyn(Item) {
+            const Data = struct { @TypeOf(inner), std.mem.Allocator };
+            const VTEntry = struct {
+                fn next(self: *anyopaque) ?Item {
+                    const data: *Data = @ptrCast(@alignCast(self));
+                    return data[0].next();
+                }
+                fn sizeHint(self: *anyopaque) struct { usize, ?usize } {
+                    const data: *Data = @ptrCast(@alignCast(self));
+                    return data[0].sizeHint();
+                }
+                fn deinit(self: *anyopaque) void {
+                    const data: *Data = @ptrCast(@alignCast(self));
+                    data[0].deinit();
+                    data[1].destroy(data);
+                }
+                const vtable: VTable = .{
+                    .next = @This().next,
+                    .sizeHint = @This().sizeHint,
+                    .deinit = @This().deinit,
+                };
+            };
+            const data = try alloc.create(Data);
+            data.* = .{ inner, alloc };
+            return .{ .data = data, .vtable = &VTEntry.vtable };
+        }
+
+        pub fn next(self: *@This()) ?Item {
+            return self.vtable.next(self.data);
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.vtable.sizeHint(self.data);
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.vtable.deinit(self.data);
+        }
+    };
+}
+
+fn DynRef(Item_: type) type {
+    return struct {
+        data: *anyopaque,
+        vtable: *const VTable,
+
+        pub const Item = Item_;
+
+        const VTable = struct {
+            next: *const fn (self: *anyopaque) ?Item,
+            sizeHint: *const fn (self: *anyopaque) struct { usize, ?usize },
+        };
+
+        pub fn init(Inner: type, inner: *Inner) Dyn(Item) {
+            const VTEntry = struct {
+                fn next(self: *anyopaque) ?Item {
+                    const old_self: *Inner = @ptrCast(@alignCast(self));
+                    return old_self.next();
+                }
+                fn sizeHint(self: *anyopaque) struct { usize, ?usize } {
+                    const old_self: *Inner = @ptrCast(@alignCast(self));
+                    return old_self.sizeHint();
+                }
+                const vtable: VTable = .{
+                    .next = @This().next,
+                    .sizeHint = @This().sizeHint,
+                };
+            };
+            return .{ .data = inner, .vtable = &VTEntry.vtable };
+        }
+
+        pub fn next(self: *@This()) ?Item {
+            return self.vtable.next(self.data);
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.vtable.sizeHint(self.data);
+        }
+
+        pub fn deinit(_: *@This()) void {}
+    };
+}
+
+fn Peek(Inner: type) type {
+    return struct {
+     (    inner: Inner,
+        cached: ?Item,
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            if (self.cached) |cached| {
+                self.cached = null;
+                return cached;
+            }
+            return self.inner.next();
+        }
+
+        pub fn peek(self: *@This()) ?Item {
+            return self.cached orelse {
+                self.cached = self.inner.next();
+                return self.cached;
+            };
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const added = if (self.cached == null) 0 else 1;
+            const lower, const upper = self.inner.sizeHint();
+            return .{ lower + added, if (upper) |u| u + added else null };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
 test "fromFn" {
     var collect = struct {
         nums: std.ArrayList(u32) = .empty,
