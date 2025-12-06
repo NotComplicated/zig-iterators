@@ -8,27 +8,75 @@ pub fn fromSlice(T: type, slice: []const T) Iter(Slice(T)) {
     return .{ ._impl = .{ .slice = slice } };
 }
 
+pub fn range(Int: type, from: Int, to: ?Int) Iter(Range(Int)) {
+    return .{ .n = from, .to = to };
+}
+
 fn Iter(Impl: type) type {
     return struct {
         _impl: Impl,
 
-        fn map(self: @This(), fun: anytype) Iter(Map(Impl, @TypeOf(fun))) {
-            return .{
-                ._impl = .{
-                    .inner = self._impl,
-                    .fun = .init(fun),
-                },
-            };
+        pub const Item = Impl.Item;
+
+        const Self = @This();
+
+        pub fn next(self: *Self) ?Item {
+            return self._impl.next();
         }
 
-        fn forEach(self: @This(), fun: anytype) void {
+        pub fn advanceBy(self: *Self, n: usize) error{Exhausted}!void {
+            for (0..n) |_| self._impl.next() orelse return error.Exhausted;
+        }
+
+        pub fn nth(self: *Self, n: usize) ?Item {
+            var item = null;
+            for (0..n) |_| item = self._impl.next() orelse return null;
+            return item;
+        }
+
+        pub fn map(self: Self, fun: anytype) Iter(Map(Impl, @TypeOf(fun))) {
+            return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
+        }
+
+        pub fn filter(self: Self, fun: anytype) Iter(Filter(Impl, @TypeOf(fun))) {
+            return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
+        }
+
+        pub fn filterMap(self: Self, fun: anytype) Iter(FilterMap(Impl, @TypeOf(fun))) {
+            return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
+        }
+
+        pub fn enumerate(self: Self, initial: usize) Iter(Enumerate(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl, .n = initial } };
+        }
+
+        pub fn stepBy(self: Self, step: usize) Iter(StepBy(Impl)) {
+            if (step == 0) @panic("step must be > 0");
+            return .{ ._impl = .{ .inner = self._impl, .step = step } };
+        }
+
+        pub fn chain(self: Self, other: anytype) Iter(Chain(Impl, @TypeOf(other))) {
+            return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
+        }
+
+        pub fn zip(self: Self, other: anytype) Iter(Zip(Impl, @TypeOf(other))) {
+            return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
+        }
+
+        pub fn consume(self: Self) void {
+            var impl = self._impl;
+            defer impl.deinit();
+            while (impl.next()) |_| {}
+        }
+
+        pub fn forEach(self: Self, fun: anytype) void {
             var impl = self._impl;
             defer impl.deinit();
             var fun_: Fn(@TypeOf(fun)) = .init(fun);
             while (impl.next()) |item| _ = fun_.call(.{item});
         }
 
-        fn intoList(self: @This(), alloc: std.mem.Allocator) !std.ArrayList(Impl.Item) {
+        pub fn intoList(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!std.ArrayList(Item) {
             var list: std.ArrayList(Impl.Item) = try .initCapacity(alloc, self._impl.sizeHint()[0]);
             errdefer list.deinit(alloc);
             var impl = self._impl;
@@ -37,12 +85,20 @@ fn Iter(Impl: type) type {
             return list;
         }
 
-        fn count(self: @This()) usize {
+        pub fn count(self: Self) usize {
             var impl = self._impl;
             defer impl.deinit();
             var total: usize = 0;
             while (impl.next()) |_| total += 1;
             return total;
+        }
+
+        pub fn last(self: Self) ?Item {
+            var impl = self._impl;
+            defer impl.deinit();
+            var last_item = null;
+            while (impl.next()) |item| last_item = item;
+            return last_item;
         }
     };
 }
@@ -91,28 +147,6 @@ fn Fn(Inner: type) type {
     };
 }
 
-fn Map(Inner: type, FnInner: type) type {
-    return struct {
-        inner: Inner,
-        fun: Fn(FnInner),
-
-        pub const Item = Fn(FnInner).Return;
-
-        pub fn next(self: *@This()) ?Item {
-            return self.fun.call(.{self.inner.next() orelse return null});
-        }
-
-        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
-            return self.inner.sizeHint();
-        }
-
-        pub fn deinit(self: *@This()) void {
-            self.inner.deinit();
-            self.fun.deinit();
-        }
-    };
-}
-
 fn FromFn(FnInner: type) type {
     return struct {
         fun: Fn(FnInner),
@@ -154,6 +188,210 @@ fn Slice(T: type) type {
     };
 }
 
+fn Range(Int: type) type {
+    return struct {
+        n: Int,
+        to: ?Int,
+
+        pub const Item = Int;
+
+        pub fn next(self: *@This()) ?Item {
+            const n = self.n;
+            if (self.to) |to| switch (std.math.order(n, to)) {
+                .eq => return null,
+                .lt => {},
+                .gt => {
+                    self.n -= 1;
+                    return n;
+                },
+            };
+            self.n += 1;
+            return n;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return if (self.to) |to| switch (std.math.order(self.n, to)) {
+                .eq => .{ 0, 0 },
+                .lt => .{ @intCast(to - self.n), @intCast(to - self.n) },
+                .gt => .{ @intCast(self.n - to), @intCast(self.n - to) },
+            } else .{ @intCast(std.math.maxInt(Int) - self.n), null };
+        }
+
+        pub fn deinit(_: *@This()) void {}
+    };
+}
+
+fn Map(Inner: type, FnInner: type) type {
+    return struct {
+        inner: Inner,
+        fun: Fn(FnInner),
+
+        pub const Item = Fn(FnInner).Return;
+
+        pub fn next(self: *@This()) ?Item {
+            return self.fun.call(.{self.inner.next() orelse return null});
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.inner.sizeHint();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            self.fun.deinit();
+        }
+    };
+}
+
+fn Filter(Inner: type, FnInner: type) type {
+    return struct {
+        inner: Inner,
+        fun: Fn(FnInner),
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            while (self.inner.next()) |item| if (self.fun.call(.{item})) return item;
+            return null;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ 0, self.inner.sizeHint()[1] };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            self.fun.deinit();
+        }
+    };
+}
+
+fn FilterMap(Inner: type, FnInner: type) type {
+    return struct {
+        inner: Inner,
+        fun: Fn(FnInner),
+
+        pub const Item = @typeInfo(Fn(FnInner).Return).optional.child;
+
+        pub fn next(self: *@This()) ?Item {
+            while (self.inner.next()) |item| if (self.fun.call(.{item})) |mapped| return mapped;
+            return null;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ 0, self.inner.sizeHint()[1] };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            self.fun.deinit();
+        }
+    };
+}
+
+fn Enumerate(Inner: type) type {
+    return struct {
+        inner: Inner,
+        n: usize,
+
+        pub const Item = struct { usize, Inner.Item };
+
+        pub fn next(self: *@This()) ?Item {
+            const item = .{ self.n, self.inner.next() orelse return null };
+            self.n += 1;
+            return item;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.inner.sizeHint();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn StepBy(Inner: type) type {
+    return struct {
+        inner: Inner,
+        step: usize,
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            const item = self.inner.next() orelse return null;
+            for (0..self.step - 1) |_| self.inner.next() orelse break;
+            return item;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const lower, const upper = self.inner.sizeHint();
+            return .{ lower / self.step, if (upper) |u| u / self.step + 1 else null };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn Chain(First: type, Second: type) type {
+    if (First.Item != Second.Item)
+        @compileError("First and second iterator must produce the same item type");
+
+    return struct {
+        first: ?First,
+        second: Second,
+
+        pub const Item = First.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            if (&self.first) |*first| {
+                if (first.next()) |item| return item;
+                first.* = null;
+            } else return self.second.next();
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const first_lower, const first_upper = self.first.sizeHint();
+            const second_lower, const second_upper = self.second.sizeHint();
+            return .{ first_lower + second_lower, first_upper + second_upper };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.first.deinit();
+            self.second.deinit();
+        }
+    };
+}
+
+fn Zip(First: type, Second: type) type {
+    return struct {
+        first: First,
+        second: Second,
+
+        pub const Item = struct { First.Item, Second.Item };
+
+        pub fn next(self: *@This()) ?Item {
+            return .{
+                self.first.next() orelse return null,
+                self.second.next() orelse return null,
+            };
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const first_lower, const first_upper = self.first.sizeHint();
+            const second_lower, const second_upper = self.second.sizeHint();
+            return .{ @min(first_lower, second_lower), @min(first_upper, second_upper) };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.first.deinit();
+            self.second.deinit();
+        }
+    };
+}
 test "fromFn" {
     var collect = struct {
         nums: std.ArrayList(u32) = .empty,
