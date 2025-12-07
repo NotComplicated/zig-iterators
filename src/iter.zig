@@ -130,11 +130,23 @@ fn Iter(Impl: type) type {
             return .{ ._impl = .{ .inner = self._impl } };
         }
 
+        pub fn dedup(self: Self) Iter(Dedup(Impl)) {
+            return .{ ._impl = .{.inner} };
+        }
+
         pub fn chain(self: Self, other: anytype) Iter(Chain(Impl, @TypeOf(other))) {
             return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
         }
 
         pub fn zip(self: Self, other: anytype) Iter(Zip(Impl, @TypeOf(other))) {
+            return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
+        }
+
+        pub fn merge(self: Self, other: anytype) Iter(Merge(Impl, @TypeOf(other))) {
+            return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
+        }
+
+        pub fn cartesianProduct(self: Self, other: anytype) Iter(Cartesian(Impl, @TypeOf(other))) {
             return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
         }
 
@@ -176,6 +188,14 @@ fn Iter(Impl: type) type {
             while (impl.next()) |item| _ = fun_.call(.{item});
         }
 
+        pub fn intoBuffer(self: Self, buffer: []Item) error{NoSpaceLeft}!usize {
+            var impl = self._impl;
+            defer impl.deinit();
+            for (buffer, 0..) |*item, i| item.* = impl.next() orelse return i;
+            if (impl.next() != null) return error.NoSpaceLeft;
+            return buffer.len;
+        }
+
         pub fn intoList(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!std.ArrayList(Item) {
             var list: std.ArrayList(Item) = try .initCapacity(alloc, self._impl.sizeHint()[0]);
             errdefer list.deinit(alloc);
@@ -192,6 +212,30 @@ fn Iter(Impl: type) type {
             var impl = self._impl;
             defer impl.deinit();
             while (impl.next()) |item| try hash_map.put(alloc, item[0], item[1]);
+            return hash_map;
+        }
+
+        pub fn intoHashSet(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!std.AutoHashMapUnmanaged(Item, void) {
+            var hash_set: std.AutoHashMapUnmanaged(Item, void) = .empty;
+            errdefer hash_set.deinit(alloc);
+            hash_set.ensureTotalCapacity(alloc, self._impl.sizeHint()[0]);
+            var impl = self._impl;
+            defer impl.deinit();
+            while (impl.next()) |item| try hash_set.put(alloc, item, {});
+            return hash_set;
+        }
+
+        pub fn intoHashMapCounts(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!std.AutoHashMapUnmanaged(Item, usize) {
+            var hash_map: std.AutoHashMapUnmanaged(Item, usize) = .empty;
+            errdefer hash_map.deinit(alloc);
+            hash_map.ensureTotalCapacity(alloc, self._impl.sizeHint()[0]);
+            var impl = self._impl;
+            defer impl.deinit();
+            while (impl.next()) |item| {
+                const result = try hash_map.getOrPut(item);
+                if (!result.found_existing) result.value_ptr.* = 0;
+                result.value_ptr.* += 1;
+            }
             return hash_map;
         }
 
@@ -1040,6 +1084,42 @@ fn Chunk(Inner: type, size: usize) type {
     };
 }
 
+fn Dedup(Inner: type) type {
+    return struct {
+        inner: Inner,
+        cached: ?Item,
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            while (self.inner.next()) |item| {
+                if (self.cached == null) self.cached = item;
+                if (!std.meta.eql(item, self.cached.?)) {
+                    const cached = self.cached;
+                    self.cached = item;
+                    return cached;
+                }
+            }
+            const cached = self.cached;
+            self.cached = null;
+            return cached;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const lower, const upper = self.inner.sizeHint();
+            return .{ @min(lower, 1), upper };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .inner = try self.inner.clone(), .cached = self.cached };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
 fn Chain(First: type, Second: type) type {
     if (First.Item != Second.Item)
         @compileError("First and second iterator must produce the same item type");
@@ -1060,7 +1140,11 @@ fn Chain(First: type, Second: type) type {
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             const first_lower, const first_upper = self.first.sizeHint();
             const second_lower, const second_upper = self.second.sizeHint();
-            return .{ first_lower +| second_lower, first_upper +| second_upper };
+            const upper = if (first_upper) |fu|
+                if (second_upper) |su| fu +| su else null
+            else
+                null;
+            return .{ first_lower +| second_lower, upper };
         }
 
         pub fn clone(self: @This()) !@This() {
@@ -1093,13 +1177,156 @@ fn Zip(First: type, Second: type) type {
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             const first_lower, const first_upper = self.first.sizeHint();
             const second_lower, const second_upper = self.second.sizeHint();
-            return .{ @min(first_lower, second_lower), @min(first_upper, second_upper) };
+            const upper = if (first_upper) |fu|
+                if (second_upper) |su| @min(fu, su) else null
+            else
+                null;
+            return .{ @min(first_lower, second_lower), upper };
         }
 
         pub fn clone(self: @This()) !@This() {
             var first = try self.first.clone();
             errdefer first.deinit();
             return .{ .first = first, .second = try self.second.clone() };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.first.deinit();
+            self.second.deinit();
+        }
+    };
+}
+
+fn Merge(First: type, Second: type) type {
+    if (First.Item != Second.Item)
+        @compileError("First and second iterator must produce the same item type");
+
+    return struct {
+        first: First,
+        second: Second,
+        cached: union(enum) {
+            first: Item,
+            second: Item,
+            none,
+        },
+
+        pub const Item = First.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            switch (self.cached) {
+                .first => |first| {
+                    if (self.second.next()) |second| {
+                        if (second <= first) return second;
+                        self.cached = .{ .second = second };
+                        return first;
+                    } else {
+                        self.cached = .none;
+                        return first;
+                    }
+                },
+                .second => |second| {
+                    if (self.first.next()) |first| {
+                        if (first <= second) return first;
+                        self.cached = .{ .first = first };
+                        return second;
+                    } else {
+                        self.cached = .none;
+                        return second;
+                    }
+                },
+                .none => {
+                    const first = self.first.next() orelse return self.second.next();
+                    const second = self.second.next() orelse return first;
+                    if (first <= second) {
+                        self.cached = .{ .second = second };
+                        return first;
+                    } else {
+                        self.cached = .{ .first = first };
+                        return second;
+                    }
+                },
+            }
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const first_lower, const first_upper = self.first.sizeHint();
+            const second_lower, const second_upper = self.second.sizeHint();
+            const add_cached = if (self.cached == .none) 0 else 1;
+            const lower = first_lower +| second_lower +| add_cached;
+            const upper = if (first_upper) |fu|
+                if (second_upper) |su| fu +| su +| add_cached else null
+            else
+                null;
+            return .{ lower, upper };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var first = try self.first.clone();
+            errdefer first.deinit();
+            return .{ .first = first, .second = try self.second.clone(), .cached = self.cached };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.first.deinit();
+            self.second.deinit();
+        }
+    };
+}
+
+fn Cartesian(First: type, Second: type) type {
+    return struct {
+        first: First,
+        cached_first_item: ?First.Item = null,
+        second: Second,
+        cached_second: ?Second = null,
+
+        pub const Item = struct { First.Item, Second.Item };
+
+        pub fn next(self: *@This()) ?Item {
+            var short_circuit = false;
+            if (self.cached_second == null) {
+                self.cached_first_item = self.first.next() orelse return null;
+                self.cached_second = self.second.clone() catch return null;
+                short_circuit = true;
+            }
+            while (true) {
+                if (self.second.next()) |second|
+                    return .{ self.cached_first_item.?, second }
+                else if (short_circuit) return null;
+                self.cached_first_item = self.first.next() orelse return null;
+                self.second = self.cached_second.clone() catch return null;
+                short_circuit = true;
+            }
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const first_lower, const first_upper = self.first.sizeHint();
+            const second_lower, const second_upper = self.second.sizeHint();
+            const csecond_lower, const csecond_upper = if (self.cached_second) |cs|
+                cs.sizeHint()
+            else
+                .{ second_lower, second_upper };
+            const lower = first_lower *| csecond_lower +| if (self.cached_second == null) 0 else second_lower;
+            const upper = upper: {
+                const fu = first_upper orelse break :upper null;
+                const su = second_upper orelse break :upper null;
+                const csu = csecond_upper orelse break :upper null;
+                break :upper fu *| csu +| if (self.cached_second == null) 0 else su;
+            };
+            return .{ lower, upper };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var first = try self.first.clone();
+            errdefer first.deinit();
+            var second = try self.second.clone();
+            errdefer second.deinit();
+            return .{
+                .first = first,
+                .cached_first_item = self.cached_first_item,
+                .second = second,
+                .cached_second = try self.cached_second.clone(),
+            };
         }
 
         pub fn deinit(self: *@This()) void {
