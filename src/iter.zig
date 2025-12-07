@@ -47,6 +47,10 @@ fn Iter(Impl: type) type {
             return .{ ._impl = .{ .inner = &self._impl } };
         }
 
+        pub fn clone(self: Self) !Iter(Impl) {
+            return .{ ._impl = try self._impl.clone() };
+        }
+
         pub fn map(self: Self, fun: anytype) Iter(Map(Impl, @TypeOf(fun))) {
             return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
         }
@@ -56,6 +60,22 @@ fn Iter(Impl: type) type {
         }
 
         pub fn filterMap(self: Self, fun: anytype) Iter(FilterMap(Impl, @TypeOf(fun))) {
+            return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
+        }
+
+        pub fn flatten(self: Self) Iter(Flatten(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl } };
+        }
+
+        pub fn flattenMonadic(self: Self) Iter(FlattenMonadic(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl } };
+        }
+
+        pub fn flattenIndexed(self: Self) Iter(FlattenIndexed(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl } };
+        }
+
+        pub fn mapWindows(self: Self, comptime size: usize, fun: anytype) Iter(MapWindows(Impl, size, @TypeOf(fun))) {
             return .{ ._impl = .{ .inner = self._impl, .fun = .init(fun) } };
         }
 
@@ -86,6 +106,10 @@ fn Iter(Impl: type) type {
             return .{ ._impl = .{ .inner = self._impl, .step = step } };
         }
 
+        pub fn chunk(self: Self, comptime size: usize) Iter(Chunk(Impl, size)) {
+            return .{ ._impl = .{ .inner = self._impl } };
+        }
+
         pub fn chain(self: Self, other: anytype) Iter(Chain(Impl, @TypeOf(other))) {
             return .{ ._impl = .{ .first = self._impl, .second = other._impl } };
         }
@@ -96,6 +120,14 @@ fn Iter(Impl: type) type {
 
         pub fn index(self: Self, i: usize) Iter(Index(Impl, i)) {
             return .{ ._impl = .{ .inner = self._impl } };
+        }
+
+        pub fn cycle(self: Self) !Iter(Cycle(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl, .benched = try self._impl.clone() } };
+        }
+
+        pub fn scan(self: Self, state: anytype, fun: anytype) Iter(Scan(Impl, @TypeOf(state), @TypeOf(fun))) {
+            return .{ ._impl = .{ .inner = self._impl, .state = state, .fun = .init(fun) } };
         }
 
         pub fn dyn(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!Iter(Dyn(Item)) {
@@ -131,6 +163,16 @@ fn Iter(Impl: type) type {
             defer impl.deinit();
             while (impl.next()) |item| try list.append(alloc, item);
             return list;
+        }
+
+        pub fn intoHashMap(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!std.AutoHashMapUnmanaged(Item[0], Item[1]) {
+            var hash_map: std.AutoHashMapUnmanaged(Item[0], Item[1]) = .empty;
+            errdefer hash_map.deinit(alloc);
+            hash_map.ensureTotalCapacity(alloc, self._impl.sizeHint()[0]);
+            var impl = self._impl;
+            defer impl.deinit();
+            while (impl.next()) |item| try hash_map.put(alloc, item[0], item[1]);
+            return hash_map;
         }
 
         pub fn count(self: Self) usize {
@@ -208,6 +250,22 @@ fn Iter(Impl: type) type {
             while (impl.next()) |item| : (pos += 1) if (fun_.call(.{item})) return pos;
             return null;
         }
+
+        pub fn max(self: Self) ?Item {
+            var impl = self._impl;
+            defer impl.deinit();
+            var max_item = impl.next() orelse return null;
+            while (impl.next()) |item| max_item = @max(item, max_item);
+            return max_item;
+        }
+
+        pub fn min(self: Self) ?Item {
+            var impl = self._impl;
+            defer impl.deinit();
+            var min_item = impl.next() orelse return null;
+            while (impl.next()) |item| min_item = @min(item, min_item);
+            return min_item;
+        }
     };
 }
 
@@ -249,6 +307,10 @@ fn Fn(Inner: type) type {
             };
         }
 
+        pub fn clone(self: @This()) !@This() {
+            return if (std.meta.hasMethod(TrueInner, "clone")) .{ .inner = try self.inner.clone() } else self;
+        }
+
         pub fn deinit(self: *@This()) void {
             if (std.meta.hasMethod(TrueInner, "deinit")) self.inner.deinit();
         }
@@ -267,6 +329,10 @@ fn FromFn(FnInner: type) type {
 
         pub fn sizeHint(_: @This()) struct { usize, ?usize } {
             return .{ 0, null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .fun = try self.fun.clone() };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -292,6 +358,10 @@ fn Slice(T: type) type {
             return .{ self.slice.len, self.slice.len };
         }
 
+        pub fn clone(self: @This()) !@This() {
+            return self;
+        }
+
         pub fn deinit(_: *@This()) void {}
     };
 }
@@ -311,6 +381,10 @@ fn SliceMut(T: type) type {
 
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             return .{ self.slice.len, self.slice.len };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return self;
         }
 
         pub fn deinit(_: *@This()) void {}
@@ -346,6 +420,10 @@ fn Range(Int: type) type {
             } else .{ @intCast(std.math.maxInt(Int) - self.n), null };
         }
 
+        pub fn clone(self: @This()) !@This() {
+            return self;
+        }
+
         pub fn deinit(_: *@This()) void {}
     };
 }
@@ -362,6 +440,10 @@ fn ByRef(Inner: type) type {
 
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             return self.inner.sizeHint();
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return self;
         }
 
         pub fn deinit(_: *@This()) void {}
@@ -381,6 +463,12 @@ fn Map(Inner: type, FnInner: type) type {
 
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             return self.inner.sizeHint();
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            const inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .fun = try self.fun.clone() };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -406,6 +494,12 @@ fn Filter(Inner: type, FnInner: type) type {
             return .{ 0, self.inner.sizeHint()[1] };
         }
 
+        pub fn clone(self: @This()) !@This() {
+            const inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .fun = try self.fun.clone() };
+        }
+
         pub fn deinit(self: *@This()) void {
             self.inner.deinit();
             self.fun.deinit();
@@ -427,6 +521,183 @@ fn FilterMap(Inner: type, FnInner: type) type {
 
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             return .{ 0, self.inner.sizeHint()[1] };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .fun = try self.fun.clone() };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            self.fun.deinit();
+        }
+    };
+}
+
+fn Flatten(Inner: type) type {
+    if (!@hasDecl(Inner, "Item")) @compileError("Flatten can only be called on an iterator of iterators");
+
+    return struct {
+        inner: Inner,
+        flattening: ?Inner.Item = null,
+
+        pub const Item = Inner.Item.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            while (true) {
+                if (&self.flattening) |*iter|
+                    return iter.next() orelse {
+                        self.flattening = null;
+                        continue;
+                    }
+                else
+                    self.flattening = self.inner.next() orelse return null;
+            }
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ if (self.flattening) |iter| iter.sizeHint()[0] else 0, null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .flattening = if (self.flattening) |iter| try iter.clone() else null };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            if (&self.flattening) |*iter| iter.deinit();
+        }
+    };
+}
+
+fn FlattenMonadic(Inner: type) type {
+    return struct {
+        inner: Inner,
+
+        pub const Item = switch (@typeInfo(Inner.Item)) {
+            .optional => |opt| opt.child,
+            .error_union => |eu| eu.payload,
+            else => @compileError("Must call flattenMonadic with an optional or error union item type"),
+        };
+
+        pub fn next(self: *@This()) ?Item {
+            while (true) {
+                const item = self.inner.next() orelse return null;
+                switch (@typeInfo(Inner.Item)) {
+                    .optional => return item orelse continue,
+                    .error_union => return item catch continue,
+                    else => unreachable,
+                }
+            }
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ 0, self.inner.sizeHint()[1] };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .inner = try self.inner.clone() };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn FlattenIndexed(Inner: type) type {
+    return struct {
+        inner: Inner,
+        cached: ?Item = null,
+        index: usize = 0,
+
+        pub const Item = item: switch (@typeInfo(Inner.Item)) {
+            .pointer => |ptr| switch (ptr.size) {
+                .many, .slice => ptr.child,
+                else => continue :item ptr.child,
+            },
+            .array => |arr| arr.child,
+            .@"struct" => |st| if (st.is_tuple) {
+                for (st.fields[1..]) |field|
+                    if (field.type != st.fields[0].type) @compileError("All types in tuple must match");
+                break :item st.fields[0].type;
+            } else @compileError("Item is not indexable"),
+            .vector => |v| v.child,
+            else => @compileError("Item is not indexable"),
+        };
+
+        pub fn next(self: *@This()) ?Item {
+            if (self.cached) |cached| if (self.index < cached.len) {
+                self.index += 1;
+                return cached[self.index - 1];
+            };
+            self.cached = self.inner.next() orelse return null;
+            self.index = 0;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const cached_size = if (self.cached) |cached| cached.len - self.index else 0;
+            switch (@typeInfo(Inner.Item)) {
+                .pointer => return .{ cached_size, null },
+                .vector, .array => |av| {
+                    const lower, const upper = self.inner.sizeHint();
+                    return .{ lower *| av.len +| cached_size, upper *| av.len +| cached_size };
+                },
+                .@"struct" => |st| {
+                    const lower, const upper = self.inner.sizeHint();
+                    return .{ lower *| st.fields.len +| cached_size, upper *| st.fields.len +| cached_size };
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .inner = try self.inner.clone(), .cached = self.cached, .index = self.index };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn MapWindows(Inner: type, size: usize, FnInner: type) type {
+    return struct {
+        inner: Inner,
+        fun: Fn(FnInner),
+        window: ?[size]Item,
+
+        pub const Item = Fn(FnInner).Return;
+
+        pub fn next(self: *@This()) ?Item {
+            if (&self.window) |*window| {
+                const item = self.inner.next() orelse return null;
+                std.mem.rotate(Item, window, 1);
+                window[window.len - 1] = item;
+            } else {
+                var window: [size]Item = undefined;
+                for (&window) |*item| item.* = self.inner.next() orelse return null;
+                self.window = window;
+            }
+            return self.fun.call(.{&self.window.?});
+        }
+
+        pub fn sizeHint(self: *@This()) struct { usize, ?usize } {
+            const lower, const upper = self.inner.sizeHint();
+            return if (self.window == null)
+                .{ lower - size + 1, if (upper) |u| u - size + 1 else null }
+            else
+                .{ lower, upper };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .fun = try self.fun.clone(), .window = self.window };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -452,6 +723,10 @@ fn Take(Inner: type) type {
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             const lower, const upper = self.inner.sizeHint();
             return .{ @min(self.n, lower), @min(self.n, upper) };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return self;
         }
 
         pub fn deinit(self: *@This()) void {
@@ -483,6 +758,12 @@ fn SkipWhile(Inner: type, FnInner: type) type {
             return .{ 0, self.inner.sizeHint()[1] };
         }
 
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .fun = if (self.fun) |fun| try fun.clone() else null };
+        }
+
         pub fn deinit(self: *@This()) void {
             self.inner.deinit();
             if (self.fun) |*fun| fun.deinit();
@@ -511,6 +792,12 @@ fn TakeWhile(Inner: type, FnInner: type) type {
             return .{ 0, self.inner.sizeHint()[1] };
         }
 
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .fun = if (self.fun) |fun| try fun.clone() else null };
+        }
+
         pub fn deinit(self: *@This()) void {
             self.inner.deinit();
             if (self.fun) |*fun| fun.deinit();
@@ -535,6 +822,12 @@ fn Enumerate(Inner: type) type {
             return self.inner.sizeHint();
         }
 
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .n = self.n };
+        }
+
         pub fn deinit(self: *@This()) void {
             self.inner.deinit();
         }
@@ -557,6 +850,41 @@ fn StepBy(Inner: type) type {
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             const lower, const upper = self.inner.sizeHint();
             return .{ lower / self.step, if (upper) |u| u / self.step + 1 else null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .step = self.step };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn Chunk(Inner: type, size: usize) type {
+    return struct {
+        inner: Inner,
+
+        pub const Item = struct { [size]Item, usize };
+
+        pub fn next(self: *@This()) ?Item {
+            var chunk: [size]Item = undefined;
+            for (&chunk, 0..) |*item, i| {
+                item.* = self.inner.next() orelse return if (i == 0) null else .{ chunk, i };
+            }
+            return .{ chunk, size };
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            const lower, const upper = self.inner.sizeHint();
+            return .{ lower / size + 1, if (upper) |u| u / size + 1 else null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .inner = try self.inner.clone() };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -585,7 +913,13 @@ fn Chain(First: type, Second: type) type {
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             const first_lower, const first_upper = self.first.sizeHint();
             const second_lower, const second_upper = self.second.sizeHint();
-            return .{ first_lower + second_lower, first_upper + second_upper };
+            return .{ first_lower +| second_lower, first_upper +| second_upper };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var first = try self.first.clone();
+            errdefer first.deinit();
+            return .{ .first = first, .second = try self.second.clone() };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -613,6 +947,12 @@ fn Zip(First: type, Second: type) type {
             const first_lower, const first_upper = self.first.sizeHint();
             const second_lower, const second_upper = self.second.sizeHint();
             return .{ @min(first_lower, second_lower), @min(first_upper, second_upper) };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var first = try self.first.clone();
+            errdefer first.deinit();
+            return .{ .first = first, .second = try self.second.clone() };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -648,8 +988,77 @@ fn Index(Inner: type, i: usize) type {
             return self.inner.sizeHint();
         }
 
+        pub fn clone(self: @This()) !@This() {
+            return .{ .inner = try self.inner.clone() };
+        }
+
         pub fn deinit(self: *@This()) void {
             self.inner.deinit();
+        }
+    };
+}
+
+fn Cycle(Inner: type) type {
+    return struct {
+        inner: Inner,
+        benched: Inner,
+
+        pub const Item = Inner.Item;
+
+        pub fn next(self: *@This()) ?Item {
+            return self.inner.next() orelse {
+                self.inner.* = self.benched.clone() catch return null;
+                return self.inner.next();
+            };
+        }
+
+        pub fn sizeHint(_: @This()) struct { usize, ?usize } {
+            return .{ std.math.maxInt(usize), null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            return .{ .inner = inner, .benched = try self.benched.clone() };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            self.benched.deinit();
+        }
+    };
+}
+
+fn Scan(Inner: type, State: type, FnInner: type) type {
+    return struct {
+        inner: Inner,
+        state: State,
+        fun: Fn(FnInner),
+
+        pub const Item = @typeInfo(Fn(FnInner).Return).optional.child;
+
+        pub fn next(self: *@This()) ?Item {
+            return self.fun.call(.{ &self.state, self.inner.next() orelse return null });
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return self.inner.sizeHint();
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            var inner = try self.inner.clone();
+            errdefer inner.deinit();
+            const has_clone = std.meta.hasMethod(State, "clone");
+            const has_deinit = std.meta.hasMethod(State, "deinit");
+            var state = if (has_clone) try self.state.clone() else self.state;
+            errdefer if (has_clone and has_deinit) state.deinit();
+            return .{ .inner = inner, .state = state, .fun = try self.fun.clone() };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+            if (std.meta.hasMethod(State, "deinit")) self.state.deinit();
+            self.fun.deinit();
         }
     };
 }
@@ -664,6 +1073,7 @@ fn Dyn(Item_: type) type {
         const VTable = struct {
             next: *const fn (self: *anyopaque) ?Item,
             sizeHint: *const fn (self: *anyopaque) struct { usize, ?usize },
+            clone: *const fn (self: *anyopaque) anyerror!*anyopaque,
             deinit: *const fn (self: *anyopaque) void,
         };
 
@@ -677,6 +1087,14 @@ fn Dyn(Item_: type) type {
                 fn sizeHint(self: *anyopaque) struct { usize, ?usize } {
                     const data: *Data = @ptrCast(@alignCast(self));
                     return data[0].sizeHint();
+                }
+                fn clone(self: *anyopaque) anyerror!*anyopaque {
+                    const data: *Data = @ptrCast(@alignCast(self));
+                    const cloned_data = try data[1].create(Data);
+                    errdefer data[1].destroy(cloned_data);
+                    cloned_data[0] = try data[0].clone();
+                    cloned_data[1] = data[1];
+                    return cloned_data;
                 }
                 fn deinit(self: *anyopaque) void {
                     const data: *Data = @ptrCast(@alignCast(self));
@@ -700,6 +1118,10 @@ fn Dyn(Item_: type) type {
 
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             return self.vtable.sizeHint(self.data);
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .data = try self.vtable.clone(self.data), .vtable = self.vtable };
         }
 
         pub fn deinit(self: *@This()) void {
@@ -746,13 +1168,17 @@ fn DynRef(Item_: type) type {
             return self.vtable.sizeHint(self.data);
         }
 
+        pub fn clone(self: @This()) !@This() {
+            return self;
+        }
+
         pub fn deinit(_: *@This()) void {}
     };
 }
 
 fn Peek(Inner: type) type {
     return struct {
-     (    inner: Inner,
+        inner: Inner,
         cached: ?Item,
 
         pub const Item = Inner.Item;
@@ -775,7 +1201,11 @@ fn Peek(Inner: type) type {
         pub fn sizeHint(self: @This()) struct { usize, ?usize } {
             const added = if (self.cached == null) 0 else 1;
             const lower, const upper = self.inner.sizeHint();
-            return .{ lower + added, if (upper) |u| u + added else null };
+            return .{ lower +| added, if (upper) |u| u +| added else null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .inner = try self.inner.clone(), .cached = self.cached };
         }
 
         pub fn deinit(self: *@This()) void {
