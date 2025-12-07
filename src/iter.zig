@@ -4,6 +4,10 @@ pub fn fromFn(fun: anytype) Iter(FromFn(@TypeOf(fun))) {
     return .{ ._impl = .{ .fun = .init(fun) } };
 }
 
+pub fn fromStdIter(iter: anytype) Iter(FromFn(FromStdIter(@TypeOf(iter)))) {
+    return .{ ._impl = .{ .fun = .init(FromStdIter(@TypeOf(iter)){ .iter = iter }) } };
+}
+
 pub fn fromSlice(T: type, slice: []const T) Iter(Slice(T)) {
     return .{ ._impl = .{ .slice = slice } };
 }
@@ -14,6 +18,18 @@ pub fn fromSliceMut(T: type, slice: []T) Iter(SliceMut(T)) {
 
 pub fn range(Int: type, from: Int, to: ?Int) Iter(Range(Int)) {
     return .{ .n = from, .to = to };
+}
+
+pub fn repeat(item: anytype) Iter(Repeat(@TypeOf(item))) {
+    return .{ .item = item };
+}
+
+pub fn empty() Iter(Slice(void)) {
+    return .{ ._impl = .{ .slice = &.{} } };
+}
+
+pub fn successors(T: type, initial: ?T, fun: anytype) Iter(Successors(@TypeOf(initial), @TypeOf(fun))) {
+    return .{ ._impl = .{ .item = initial, .fun = .init(fun) } };
 }
 
 fn Iter(Impl: type) type {
@@ -72,6 +88,10 @@ fn Iter(Impl: type) type {
         }
 
         pub fn flattenIndexed(self: Self) Iter(FlattenIndexed(Impl)) {
+            return .{ ._impl = .{ .inner = self._impl } };
+        }
+
+        pub fn windows(self: Self, comptime size: usize) Iter(Windows(Impl, size)) {
             return .{ ._impl = .{ .inner = self._impl } };
         }
 
@@ -266,6 +286,36 @@ fn Iter(Impl: type) type {
             while (impl.next()) |item| min_item = @min(item, min_item);
             return min_item;
         }
+
+        pub fn order(self: Self, other: anytype) std.math.Order {
+            var impl = self._impl;
+            defer impl.deinit();
+            var other_impl = other._impl;
+            defer other_impl.deinit();
+            while (impl.next()) |item| {
+                const other_item = other_impl.next() orelse return .gt;
+                const ord = std.math.order(item, other_item);
+                if (ord != .eq) return ord;
+            }
+            if (other_impl.next() != null) return .lt;
+            return .eq;
+        }
+
+        pub fn sum(self: Self) Item {
+            var impl = self._impl;
+            defer impl.deinit();
+            var acc: Item = 0;
+            while (impl.next()) |item| acc += item;
+            return acc;
+        }
+
+        pub fn product(self: Self) Item {
+            var impl = self._impl;
+            defer impl.deinit();
+            var acc: Item = 1;
+            while (impl.next()) |item| acc *= item;
+            return acc;
+        }
     };
 }
 
@@ -313,6 +363,16 @@ fn Fn(Inner: type) type {
 
         pub fn deinit(self: *@This()) void {
             if (std.meta.hasMethod(TrueInner, "deinit")) self.inner.deinit();
+        }
+    };
+}
+
+fn FromStdIter(StdIter: type) type {
+    return struct {
+        iter: StdIter,
+
+        pub fn call(self: *@This()) ?@typeInfo(@FieldType(StdIter, "next")).@"fn".return_type.? {
+            return self.iter.next();
         }
     };
 }
@@ -425,6 +485,55 @@ fn Range(Int: type) type {
         }
 
         pub fn deinit(_: *@This()) void {}
+    };
+}
+
+fn Repeat(Item_: type) type {
+    return struct {
+        item: Item,
+
+        pub const Item = Item_;
+
+        pub fn next(self: *@This()) ?Item {
+            return self.item;
+        }
+
+        pub fn sizeHint(_: @This()) struct { usize, ?usize } {
+            return .{ std.math.maxInt(usize), null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return self;
+        }
+
+        pub fn deinit(_: *@This()) void {}
+    };
+}
+
+fn Successors(Item_: type, FnInner: type) type {
+    return struct {
+        item: ?Item,
+        fun: Fn(FnInner),
+
+        pub const Item = Item_;
+
+        pub fn next(self: *@This()) ?Item {
+            const item = self.item orelse return null;
+            self.item = self.fun.call(.{item});
+            return item;
+        }
+
+        pub fn sizeHint(self: @This()) struct { usize, ?usize } {
+            return .{ if (self.item == null) 0 else 1, null };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .item = self.item, .fun = try self.fun.clone() };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.fun.deinit();
+        }
     };
 }
 
@@ -657,6 +766,44 @@ fn FlattenIndexed(Inner: type) type {
 
         pub fn clone(self: @This()) !@This() {
             return .{ .inner = try self.inner.clone(), .cached = self.cached, .index = self.index };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.inner.deinit();
+        }
+    };
+}
+
+fn Windows(Inner: type, size: usize) type {
+    return struct {
+        inner: Inner,
+        window: ?[size]Item,
+
+        pub const Item = [size]Item;
+
+        pub fn next(self: *@This()) ?Item {
+            if (&self.window) |*window| {
+                const item = self.inner.next() orelse return null;
+                std.mem.rotate(Item, window, 1);
+                window[window.len - 1] = item;
+            } else {
+                var window: [size]Item = undefined;
+                for (&window) |*item| item.* = self.inner.next() orelse return null;
+                self.window = window;
+            }
+            return self.window.?;
+        }
+
+        pub fn sizeHint(self: *@This()) struct { usize, ?usize } {
+            const lower, const upper = self.inner.sizeHint();
+            return if (self.window == null)
+                .{ lower - size + 1, if (upper) |u| u - size + 1 else null }
+            else
+                .{ lower, upper };
+        }
+
+        pub fn clone(self: @This()) !@This() {
+            return .{ .inner = try self.inner.clone(), .window = self.window };
         }
 
         pub fn deinit(self: *@This()) void {
